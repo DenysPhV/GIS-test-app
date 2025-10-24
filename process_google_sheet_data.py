@@ -1,10 +1,16 @@
 import os
+import sys
 import gspread
+import logging
 import pandas as pd
 
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
-from logger_config import logging
+from logger_config import setup_logger
+
+
+setup_logger()
+logger = logging.getLogger(__name__)
 
 def process_google_sheet_data(sheet_url: str, credentials_path: str) -> pd.DataFrame:
     """
@@ -24,26 +30,27 @@ def process_google_sheet_data(sheet_url: str, credentials_path: str) -> pd.DataF
     # Відкриття таблиці та зчитування даних у DataFrame
     sheet = client.open_by_url(sheet_url).sheet1
     data = sheet.get_all_records()
-
-    # Перевірка, чи дані не порожні, перед створенням DataFrame
-    if not data:
-        logging.warning("Попередження: Не знайдено даних у Google Sheet.")
-        return pd.DataFrame()
     
     source_df = pd.DataFrame(data)
-
-    # Список для зберігання нових, трансформованих рядків
     processed_rows = []
-
-    # Визначення колонок зі значеннями
     value_columns = [f'Значення {i}' for i in range(1, 11)]
+
+    if not data:
+        logger.warning("No data found in the Google Sheet.")
+        return pd.DataFrame()
     
     # Ітерація по кожному рядку вихідного DataFrame
     for _, row in source_df.iterrows():
-        # Зберігаємо значення з колонок "Значення" в окремий словник
-        # і конвертуємо їх у числовий тип, ігноруючи помилки
-        values = {col: pd.to_numeric(row.get(col), errors="coerce") for col in value_columns}
-        values= {k: v if pd.notna(v) else 0 for k, v in values.items()}
+        values = {}
+        
+        for col in value_columns:
+            raw_value = row.get(col)
+            if raw_value is not None and str(raw_value).strip() != '':
+                clean_value_str = str(raw_value).replace(',', '.')
+                numeric_value = pd.to_numeric(clean_value_str, errors='coerce')
+                values[col] = numeric_value if pd.notna(numeric_value) else 0
+            else:
+                values[col] = 0
 
         # Знаходимо максимальне значення серед усіх колонок "Значення"
         max_value = int(max(values.values()))
@@ -54,11 +61,11 @@ def process_google_sheet_data(sheet_url: str, credentials_path: str) -> pd.DataF
         # Створення нових рядків на основі max_value
         for i in range(1, max_value + 1):
             new_row = {
-                'Дата': row['Дата'],
-                'Область': row['Область'],
-                'Місто': row['Місто'],
-                'long': row['long'],
-                'lat': row['lat']
+                'Дата': row.get('Дата', ''),
+                'Область': row.get('Область', ''),
+                'Місто': row.get('Місто', ''),
+                'long': str(row.get('long', '0')).replace(',', '.'),
+                'lat': str(row.get('lat', '0')).replace(',', '.')
             }
             # Заповнення колонок "Значення" за визначеною логікою
             for col_name, original_value in values.items():
@@ -70,21 +77,30 @@ def process_google_sheet_data(sheet_url: str, credentials_path: str) -> pd.DataF
 
 if __name__ == "__main__":
    load_dotenv()
+   script_dir = os.path.dirname(os.path.abspath(__file__))
    SHEET_URL = os.environ.get("SHEET_URL")
-   CREDENTIALS_FILE = os.environ.get("CREDENTIALS_FILE_NAME")
+   CREDENTIALS_FILE_NAME = os.environ.get("CREDENTIALS_FILE_NAME")
+
+   if not SHEET_URL or not CREDENTIALS_FILE_NAME:
+       logger.critical("Error: SHEET_URL or CREDENTIALS_FILE not found in the .env file.")
+       sys.exit(1)
+
+   CREDENTIALS_FILE = os.path.join(script_dir, CREDENTIALS_FILE_NAME)
+
+   logger.info(f"Starting data processing for: {SHEET_URL}")
 
    try:
+        if not os.path.exists(CREDENTIALS_FILE):
+           logger.critical(f"FATAL: Credentials file not found: {CREDENTIALS_FILE}")
+           sys.exit(1)
+           
         processed_dataframe = process_google_sheet_data(SHEET_URL, CREDENTIALS_FILE)
         
         if not processed_dataframe.empty:
-            logging.info("Data processed successfully. Number of new lines:", len(processed_dataframe))
-            logging.info("First 5 lines of transformed data:")
-            logging.info(processed_dataframe.head())
+            logger.info(f"Data processed successfully. Generated {len(processed_dataframe)} new rows.")
+            logger.info("First 5 rows of transformed data:\n" + processed_dataframe.head().to_string())
         else:
-            logging.info("Processing is complete, but no lines have been generated.")
+            logger.warning("Processing finished, but no rows were generated.")
             
-   except FileNotFoundError:
-       logging.error(f"Credentials file not found by path: {CREDENTIALS_FILE}")
-       logging.info("Please check and correct the path in the CREDENTIALS_FILE variable.")
-   except Exception as e:
-       logging.error(f"An unexpected error occurred during execution: {e}")
+   except Exception:
+       logger.exception("An unexpected error occurred during execution.")
