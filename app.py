@@ -1,6 +1,7 @@
 import os
 import folium
 import traceback
+import logging
 import pandas as pd
 
 from flask import Flask, render_template
@@ -10,9 +11,14 @@ from dotenv import load_dotenv
 
 # Імпортуємо функцію для обробки даних
 from process_google_sheet_data import process_google_sheet_data
-from logger_config import logging
+from upload_data_to_arcgis import upload_data_to_arcgis
+
+from logger_config import setup_logger
 
 load_dotenv()
+setup_logger()
+logger = logging.getLogger(__name__)
+
 
 app = Flask(__name__)
 
@@ -44,14 +50,18 @@ def create_map_from_df(df: pd.DataFrame):
 
 @app.route('/')
 def index():
-    logging.info("Home page request received...")
+    logger.info("Home page request received...")
     
     SHEET_URL = os.environ.get("SHEET_URL")
     CREDENTIALS_FILE_NAME = os.environ.get("CREDENTIALS_FILE")
+    ARCGIS_URL = os.environ.get("ARCGIS_URL")
+    ARCGIS_USERNAME = os.environ.get("ARCGIS_USERNAME")
+    ARCGIS_PASSWORD = os.environ.get("ARCGIS_PASSWORD")
+    ITEM_ID = os.environ.get("ITEM_ID")
     
     if not SHEET_URL or not CREDENTIALS_FILE_NAME:
         error_msg = "CONFIGURATION ERROR: NO SHEET_URL or CREDENTIALS_FILE_NAME variables found. Check if the.env file exists and is downloaded."
-        logging.error(error_msg)
+        logger.error(error_msg)
         return error_msg, 500
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -63,11 +73,12 @@ def index():
         if not os.path.exists(CREDENTIALS_FILE):
             raise FileNotFoundError(f"Файл облікових даних '{CREDENTIALS_FILE_NAME}' не знайдено у папці проєкту.")
 
-        logging.info("Launching data processing from Google Sheets...")
+        logger.info("Launching data processing from Google Sheets...")
         processed_df = process_google_sheet_data(SHEET_URL, CREDENTIALS_FILE)
-
+            
+       
         if processed_df is not None and not processed_df.empty:
-            logging.info(f"Data successfully received. {len(processed_df)} lines.")
+            logger.info(f"Data successfully received. {len(processed_df)} lines.")
 
             table_html = processed_df.to_html(
                 classes='display compact hover',
@@ -75,15 +86,28 @@ def index():
                 border=2,
                 index=False
             )
+
             map_html = create_map_from_df(processed_df)
-            logging.info("Map created.")
+            logger.info("Map created.")
+
+            logger.info("Uploading processed data to ArcGIS Online...")
+            upload_data_to_arcgis(
+                processed_df,
+                ARCGIS_URL,
+                ARCGIS_USERNAME,
+                ARCGIS_PASSWORD,
+                ITEM_ID
+            )
+            logger.info("Upload to ArcGIS completed successfully.")
+
         else:
             error_message = "Data was not obtained from Google Sheets. The table may be empty or an access error has occurred."
-            logging.error(error_message)
+            logger.error(error_message)
+            logger.warning("Processed DataFrame is empty — skipping ArcGIS upload.")
 
     except Exception as e:
         error_message = f"An error occurred while executing: {e}"
-        logging.error(error_message)
+        logger.error(error_message)
         traceback.print_exc()
 
     return render_template(

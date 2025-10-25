@@ -5,7 +5,6 @@ import pandas as pd
 
 from dotenv import load_dotenv
 from arcgis.gis import GIS
-from arcgis.features import Feature
 
 from logger_config import setup_logger
 from process_google_sheet_data import process_google_sheet_data
@@ -15,142 +14,85 @@ logger = logging.getLogger(__name__)
 
 def upload_data_to_arcgis(df: pd.DataFrame, gis_url: str, gis_user: str, gis_pass: str, item_id: str):
     """
-    Uploads data from a DataFrame to a specified Feature Layer in ArcGIS Online.
-    
-    This function:
-    1. Connects to the GIS.
-    2. Clears all existing features from the target layer.
-    3. Processes coordinates (handling both integer and decimal formats).
-    4. Maps DataFrame columns to layer fields.
-    5. Uploads new features in chunks.
+    З'єднуємося з ArcGIS Online і додаємо точки з DataFrame до hosted feature layer.
+    Очікується, що df має колонки: 'Дата' (або d_date), 'Область' (t_region), 'Місто' (t_city),
+    'i_value_1'..'i_value_10' (або відповідні), а також 'long' та 'lat' або 'long_num'/'lat_num'.
     """
+    logger.info(f"Connecting to ArcGIS: {gis_url} as {gis_user}")
+    gis = GIS(gis_url, gis_user, gis_pass)
 
+    # Отримати item і перший layer
+    item = gis.content.get(item_id)
+    if item is None:
+        logger.error(f"Feature service item not found for ITEM_ID={item_id}")
+        return
+
+    # Припускаємо, що перший шар — потрібний hosted feature layer
     try:
-        logger.info("connect up to ArcGIS Online...")
-        gis = GIS(gis_url, gis_user, gis_pass)
-        logger.info(f"Successfully connected as user: {gis.properties.user.username}")
+        flayer = item.layers[0]
+    except Exception as e:
+        logger.exception("Cannot access layers from item. Item.layers may be empty.")
+        return
 
-        logger.info(f"Searching for item with ID: {item_id}...")
-        feature_layer_item = gis.content.get(item_id)
+    logger.info(f"Target layer found: {flayer.properties.name}")
 
-        if not feature_layer_item:
-            logger.critical(f"FATAL: Could not find item with ID: {item_id}. Please check the ID.")
-            sys.exit(1)
+    # Перетворення DataFrame у список features
+    features_payload = []
+    for _, row in df.iterrows():
+        try:
+            lon = None
+            lat = None
+            for cand in ("long_num", "long", "longitude", "x"):
+                if cand in row and pd.notna(row[cand]):
+                    lon = float(row[cand])
+                    break
+            for cand in ("lat_num", "lat", "latitude", "y"):
+                if cand in row and pd.notna(row[cand]):
+                    lat = float(row[cand])
+                    break
 
-        if not feature_layer_item.layers:
-            logger.critical(f"FATAL: Item found, but it contains no layers accessible to user '{gis_user}'. Please check permissions.")
-            sys.exit(1)
-        
-        feature_layer = feature_layer_item.layers[0] 
-        logger.info(f"Successfully accessed layer: '{feature_layer.properties.name}'")
-
-        logger.info("Clearing old data from the layer (executing delete_features where='1=1')...")
-        feature_layer.delete_features(where="1=1")
-        logger.info("Layer cleared successfully.")
-
-        # Мапінг колонок DataFrame на поля атрибутивної таблиці шару
-        field_mapping = {
-            'Дата': 'd_date',
-            'Область': 't_region',
-            'Місто': 't_city',
-            'Значення 1': 'i_value_1', 'Значення 2': 'i_value_2',
-            'Значення 3': 'i_value_3', 'Значення 4': 'i_value_4',
-            'Значення 5': 'i_value_5', 'Значення 6': 'i_value_6',
-            'Значення 7': 'i_value_7', 'Значення 8': 'i_value_8',
-            'Значення 9': 'i_value_9', 'Значення 10': 'i_value_10',
-            'long': 'long', 'lat': 'lat'
-        }
-
-        features_to_add = []
-        logger.info("Preparing objects to download...")
-
-        for _, row in df.iterrows():
-            try:
-                # --- START: SMART COORDINATE PROCESSING LOGIC ---
-                # This logic handles both integer (e.g., 307306393) and decimal (e.g., 30.252525) formats.
-                
-                lon_raw = str(row['long']).strip()
-                lat_raw = str(row['lat']).strip()
-
-                # Skip if coordinates are missing
-                if not lon_raw or not lat_raw:
-                    logger.warning(f"Skipping row with missing coordinate data: {row.to_dict()}")
-                    continue
-
-                lon = float(lon_raw)
-                lat = float(lat_raw)
-
-                # Skip if coordinates are (0,0) (often means missing data)
-                if lon == 0 and lat == 0:
-                    logger.warning(f"Skipping row with (0,0) coordinates: {row.to_dict()}")
-                    continue
-
-                # If latitude seems to be in integer format (e.g., 464702111 > 90)
-                if abs(lat) > 90:
-                    lat = lat / 10000000.0
-                
-                # If longitude seems to be in integer format (e.g., 307306393 > 180)
-                if abs(lon) > 180:
-                    lon = lon / 10000000.0
-
-                # Final validation to ensure coordinates are within valid GIS bounds
-                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                    logger.warning(f"Skipping row with invalid final coordinates (lat={lat}, lon={lon})")
-                    continue
-                # --- END: SMART COORDINATE PROCESSING LOGIC ---
-
-                # Create attributes based on mapping
-                attributes = {arcgis_field: row.get(df_col) for df_col, arcgis_field in field_mapping.items()}
-                
-                # Overwrite attributes with the *processed* coordinates
-                attributes['long'] = lon
-                attributes['lat'] = lat
-
-                # Create the geometry object
-                geometry = {'x': lon, 'y': lat, 'spatialReference': {'wkid': 4326}}
-                feature = Feature(geometry=geometry, attributes=attributes)
-                features_to_add.append(feature)
-
-            except (ValueError, TypeError, AttributeError):
-                logger.warning(f"Skipping row due to invalid/non-numeric coordinate data: {row.to_dict()}")
+            if lon is None or lat is None:
+                logger.warning(f"Skipping row without coords: {_}")
                 continue
 
-        if not features_to_add:
-            logger.warning("No valid features to add after processing. Finishing process.")
-            return
+            attrs = {
+                "d_date": row.get("Дата") or row.get("d_date"),
+                "t_region": row.get("Область") or row.get("t_region"),
+                "t_city": row.get("Місто") or row.get("t_city"),
+            }
+            for i in range(1, 11):
+                colname = f"Значення {i}"
+                field_out = f"i_value_{i}"
+                if colname in row:
+                    attrs[field_out] = row[colname]
+                elif field_out in row:
+                    attrs[field_out] = row[field_out]
 
-        # Для надійності, спочатку очистимо шар від старих даних
-        logger.info("Cleaning the layer from old data...")
-        feature_layer.delete_features(where="1=1")
+            feat = {
+                "geometry": {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}},
+                "attributes": attrs
+            }
+            features_payload.append(feat)
+        except Exception:
+            logger.exception("Error converting row to feature.")
 
-        # Upload data in chunks to avoid timeouts
-        chunk_size = 1000
-        total_chunks = -(-len(features_to_add) // chunk_size)
+    if not features_payload:
+        logger.warning("No features prepared to upload.")
+        return
 
-        for i in range(0, len(features_to_add), chunk_size):
-            chunk = features_to_add[i:i + chunk_size]
-            logger.info(f"Uploading chunk {i//chunk_size + 1}/{total_chunks} ({len(chunk)} features)...")
-            result = feature_layer.edit_features(adds=chunk)
-            
-            success_count = sum(1 for item in result.get('addResults', []) if item.get('success'))
-            error_count = len(chunk) - success_count
-            logger.info(f"Chunk upload complete. Success: {success_count}, Errors: {error_count}")
-            
-            if error_count > 0:
-                # Log details of failed uploads for debugging
-                error_details = [res.get('error') for res in result.get('addResults', []) if not res.get('success')]
-                logger.error(f"Error details for failed uploads: {error_details}")
-
-    except Exception as e:
-        # logger.exception automatically captures and logs the full traceback
-        logger.exception("A critical error occurred during an ArcGIS operation.")
+    try:
+        logger.info(f"Uploading {len(features_payload)} features to layer...")
+        res = flayer.edit_features(adds=features_payload)
+        logger.info(f"Upload result: {res}")
+    except Exception:
+        logger.exception("Failed to upload features to ArcGIS.")
 
 def load_config():
     """Loads and validates configuration from the .env file."""
     load_dotenv()
     config = {
         "SHEET_URL": os.environ.get("SHEET_URL"),
-        "CREDENTIALS_FILE_NAME": os.environ.get("CREDENTIALS_FILE_NAME"),
+        "CREDENTIALS_FILE_NAME": os.environ.get("CREDENTIALS_FILE"),
         "ARCGIS_URL": os.environ.get("ARCGIS_URL"),
         "ARCGIS_USERNAME": os.environ.get("ARCGIS_USERNAME"),
         "ARCGIS_PASSWORD": os.environ.get("ARCGIS_PASSWORD"),
